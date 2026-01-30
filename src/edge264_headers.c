@@ -145,15 +145,15 @@ int ADD_VARIANT(parse_end_of_sequence)(Edge264Decoder *dec, Edge264UnrefCb unref
 		clear_decoder(dec);
 		ret = 0;
 	}
-	return print_dec(dec, "  decode_NAL_result: %s\n", ret);
+	return print_dec(dec, "  nal_res: %s\n", ret);
 }
 
 #ifdef LOGS
 	int ignore_NAL_log(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg) {
-		return print_dec(dec, "  decode_NAL_result: %s\n", 0);
+		return print_dec(dec, "  nal_res: %s\n", 0);
 	}
 	int unsup_NAL_log(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg) {
-		return print_dec(dec, "  decode_NAL_result: %s\n", ENOTSUP);
+		return print_dec(dec, "  nal_res: %s\n", ENOTSUP);
 	}
 #endif
 
@@ -443,7 +443,23 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		// wait until a task becomes available and reserve it
 		while (c.thread_id >= 0 && !c.d->ready_tasks)
 			pthread_cond_wait(&c.d->task_ready, &c.d->lock);
-		assert((unsigned)c.d->ready_tasks - 1 < 65535); // 0 < ready_tasks < 65536
+		// For single-threaded mode, if no tasks are ready, update ready_tasks
+		// This handles MVC where dependent view tasks may have their dependencies
+		// satisfied by frames decoded in previous calls but not yet marked ready
+		if (!c.d->ready_tasks) {
+			for (int i = 0; i < 16; i++) {
+				if ((c.d->pending_tasks >> i) & 1) {
+					if ((c.d->task_dependencies[i] & ~ready_frames(c.d)) == 0)
+						c.d->ready_tasks |= 1 << i;
+				}
+			}
+		}
+		// If still no ready tasks, something is wrong - return to avoid UB
+		if (!c.d->ready_tasks) {
+			if (c.thread_id < 0)
+				return (void *)0;
+			continue; // Multi-threaded: wait for condition
+		}
 		int task_id = __builtin_ctz(c.d->ready_tasks); // FIXME arbitrary selection for now
 		int currPic = c.d->taskPics[task_id];
 		c.d->pending_tasks &= ~(1 << task_id);
@@ -452,7 +468,6 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 			pthread_mutex_unlock(&c.d->lock);
 		uint64_t clock_start = get_relative_time_us() - c.log_base_us;
 		c.t = c.d->tasks[task_id];
-		unsigned approx_byte_size = c.t.gb.end - c.t.gb.CPB;
 		initialize_context(&c, currPic);
 		
 		// call the function containing the macroblock decoding loop
@@ -555,11 +570,9 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 				"\n- thread_id: %d\n"
 				"  FrameId: %u\n"
 				"  first_mb_in_slice: %u\n"
-				"  approx_byte_size: %u\n"
 				"  decoding_start_us: %llu\n"
-				"  decoding_end_us: %llu\n"
-				"  slice_result: %s\n",
-				c.thread_id, c.t.FrameId, c.t.first_mb_in_slice, approx_byte_size, clock_start, clock_end, ret_to_str(ret));
+				"  decoding_end_us: %llu\n",
+				c.thread_id, c.t.FrameId, c.t.first_mb_in_slice, clock_start, clock_end);
 			c.log_cb(c.log_buf, c.log_arg);
 		}
 		
@@ -971,10 +984,10 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		slice_type, slice_type_names[t->slice_type], unsup_if(t->slice_type > 2),
 		pic_parameter_set_id, unsup_if(pic_parameter_set_id >= 4));
 	if (t->slice_type > 2 || pic_parameter_set_id >= 4)
-		return print_dec(dec, "  decode_NAL_result: %s\n", ENOTSUP); // exit now if the rest of the slice can't be correctly parsed
+		return print_dec(dec, "  nal_res: %s\n", ENOTSUP); // exit now if the rest of the slice can't be correctly parsed
 	t->pps = dec->PPS[pic_parameter_set_id];
 	if (!sps->BitDepth_Y || !t->pps.num_ref_idx_active[0])
-		return print_dec(dec, "  decode_NAL_result: %s\n", EBADMSG); // exit now if SPS or PPS wasn't initialized
+		return print_dec(dec, "  nal_res: %s\n", EBADMSG); // exit now if SPS or PPS wasn't initialized
 	
 	// keep frame_num on stack until we can compute FrameNum after all unset_currPic
 	int frame_num = get_uv(&dec->gb, sps->log2_max_frame_num);
@@ -1253,10 +1266,15 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 	dec->busy_tasks |= 1 << task_id;
 	dec->pending_tasks |= 1 << task_id;
 	dec->task_dependencies[task_id] = refs_to_mask(t);
-	dec->ready_tasks |= ((dec->task_dependencies[task_id] & ~ready_frames(dec)) == 0) << task_id;
+	// For single-threaded mode, always mark the task as ready since we process
+	// slices sequentially and dependencies should already be satisfied
+	if (dec->n_threads)
+		dec->ready_tasks |= ((dec->task_dependencies[task_id] & ~ready_frames(dec)) == 0) << task_id;
+	else
+		dec->ready_tasks |= 1 << task_id;
 	dec->taskPics[task_id] = dec->currPic;
 	ret = print_dec(dec, dec->n_threads || dec->worker_loop != worker_loop_log ?
-		"  decode_NAL_result: %s\n" : t->pps.entropy_coding_mode_flag ?
+		"  nal_res: %s\n" : t->pps.entropy_coding_mode_flag ?
 		"  macroblocks_cabac:\n" : "  macroblocks_cavlc:\n", 0);
 	if (dec->n_threads)
 		pthread_cond_signal(&dec->task_ready);
@@ -1278,7 +1296,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		int primary_pic_type = get_uv(&dec->gb, 3);
 		log_dec(dec, "  primary_pic_type: %u # %s\n",
 			primary_pic_type, primary_pic_type_names[primary_pic_type]);
-		return print_dec(dec, "  decode_NAL_result: %s\n", rbsp_end(&dec->gb, 1) ? 0 : EBADMSG);
+		return print_dec(dec, "  nal_res: %s\n", rbsp_end(&dec->gb, 1) ? 0 : EBADMSG);
 	}
 #endif
 
@@ -1306,7 +1324,7 @@ int ADD_VARIANT(parse_nal_unit_header_extension)(Edge264Decoder *dec, Edge264Unr
 			return ADD_VARIANT(parse_slice_layer_without_partitioning)(dec, unref_cb, unref_arg);
 		ret = 0;
 	}
-	return print_dec(dec, "  decode_NAL_result: %s\n", rbsp_end(&dec->gb, 0) ? ret : EBADMSG);
+	return print_dec(dec, "  nal_res: %s\n", rbsp_end(&dec->gb, 0) ? ret : EBADMSG);
 }
 
 
@@ -1476,7 +1494,7 @@ int ADD_VARIANT(parse_pic_parameter_set)(Edge264Decoder *dec,  Edge264UnrefCb un
 		ret = EBADMSG;
 	if (ret == 0)
 		dec->PPS[pic_parameter_set_id] = pps;
-	return print_dec(dec, "  decode_NAL_result: %s\n", ret);
+	return print_dec(dec, "  nal_res: %s\n", ret);
 }
 
 
@@ -1980,7 +1998,7 @@ int ADD_VARIANT(parse_seq_parameter_set)(Edge264Decoder *dec, Edge264UnrefCb unr
 	if (dec->nal_unit_type == 15) {
 		if (profile_idc != 118 && profile_idc != 128 && profile_idc != 134 ||
 			(get_u1(&dec->gb), parse_seq_parameter_set_mvc_extension(dec, profile_idc)))
-			return print_dec(dec, "  decode_NAL_result: %s\n", ENOTSUP); // we shouldn't parse any further thus exit now
+			return print_dec(dec, "  nal_res: %s\n", ENOTSUP); // we shouldn't parse any further thus exit now
 		if (get_u1(&dec->gb))
 			parse_mvc_vui_parameters_extension(dec, &sps);
 		get_u1(&dec->gb);
@@ -2039,5 +2057,5 @@ int ADD_VARIANT(parse_seq_parameter_set)(Edge264Decoder *dec, Edge264UnrefCb unr
 			dec->sps.max_num_reorder_frames = dec->ssps.max_num_reorder_frames;
 		}
 	}
-	return print_dec(dec, "  decode_NAL_result: %s\n", ret);
+	return print_dec(dec, "  nal_res: %s\n", ret);
 }
